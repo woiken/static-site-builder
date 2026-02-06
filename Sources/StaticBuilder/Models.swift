@@ -34,3 +34,10 @@ struct BuildStatusUpdate: Codable, Sendable {
     let logSnippet: String?
     let timestamp: String
 }
+
+/// A single log line streamed to the logs exchange during a build.
+struct BuildLogLine: Codable, Sendable {
+    let buildId: String
+    let line: String
+    let timestamp: String
+}

@@ -7,6 +7,9 @@ import NIOPosix
 /// The main worker loop. Connects to RabbitMQ, consumes build commands,
 /// executes them, and publishes status updates back to a results queue
 /// for the API service to consume and persist.
+///
+/// Build log lines are streamed in real-time to a topic exchange so the
+/// API can forward them to WebSocket clients.
 struct Worker: Sendable {
     let config: Config
     let logger: Logger
@@ -39,6 +42,10 @@ struct Worker: Sendable {
         let resultsQueue = config.rabbitmqResultsQueue
         try await channel.queueDeclare(name: resultsQueue, durable: true)
 
+        // Declare log streaming exchange (topic type, routing key = buildId)
+        let logsExchange = config.rabbitmqLogsExchange
+        try await channel.exchangeDeclare(name: logsExchange, type: "topic", durable: true)
+
         // Declare dead-letter exchange + queue for unprocessable commands
         let dlxExchange = "\(commandsQueue).dlx"
         let dlqName = "\(commandsQueue).dlq"
@@ -49,7 +56,7 @@ struct Worker: Sendable {
         // Set prefetch
         try await channel.basicQos(count: config.prefetchCount)
 
-        logger.info("Consuming from '\(commandsQueue)', publishing results to '\(resultsQueue)'")
+        logger.info("Consuming from '\(commandsQueue)', publishing results to '\(resultsQueue)', logs to '\(logsExchange)'")
 
         let s3Uploader = S3Uploader(config: config, logger: logger)
         let executor = BuildExecutor(config: config, logger: logger, s3Uploader: s3Uploader)
@@ -77,8 +84,15 @@ struct Worker: Sendable {
                     status: .running
                 )
 
-                // Execute build
-                let result = try await executor.execute(cmd)
+                // Execute build with live log streaming
+                let result = try await executor.execute(cmd) { line in
+                    try? await publishLogLine(
+                        channel: channel,
+                        exchange: logsExchange,
+                        buildId: cmd.id,
+                        line: line
+                    )
+                }
 
                 // Publish terminal status
                 if result.success {
@@ -122,6 +136,28 @@ struct Worker: Sendable {
         // Cleanup
         try await s3Uploader.shutdown()
         try await amqpConn.close()
+    }
+
+    /// Publish a single log line to the logs exchange with the buildId as routing key.
+    private func publishLogLine(
+        channel: AMQPChannel,
+        exchange: String,
+        buildId: String,
+        line: String
+    ) async throws {
+        let message = BuildLogLine(
+            buildId: buildId,
+            line: line,
+            timestamp: ISO8601DateFormatter().string(from: Date())
+        )
+        let jsonData = try JSONEncoder().encode(message)
+        var buffer = ByteBufferAllocator().buffer(capacity: jsonData.count)
+        buffer.writeBytes(jsonData)
+        _ = try await channel.basicPublish(
+            from: buffer,
+            exchange: exchange,
+            routingKey: buildId
+        )
     }
 
     /// Publish a BuildStatusUpdate to the results queue.

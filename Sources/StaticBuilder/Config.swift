@@ -8,6 +8,7 @@ struct Config: Sendable {
     let rabbitmqPassword: String
     let rabbitmqQueue: String
     let rabbitmqResultsQueue: String
+    let rabbitmqLogsExchange: String
 
     let workDir: String
     let prefetchCount: UInt16
@@ -27,6 +28,7 @@ struct Config: Sendable {
             rabbitmqPassword: env("RABBITMQ_PASSWORD", default: "static_site"),
             rabbitmqQueue: env("RABBITMQ_QUEUE", default: "site-build-commands"),
             rabbitmqResultsQueue: env("RABBITMQ_RESULTS_QUEUE", default: "site-build-results"),
+            rabbitmqLogsExchange: env("RABBITMQ_LOGS_EXCHANGE", default: "site-build-logs"),
 
             workDir: env("WORK_DIR", default: "/tmp/static-builder/work"),
             prefetchCount: UInt16(env("PREFETCH_COUNT", default: "1"))!,

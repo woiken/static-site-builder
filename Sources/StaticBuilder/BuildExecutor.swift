@@ -18,6 +18,9 @@ struct BuildExecutor: Sendable {
         let logSnippet: String?
     }
 
+    /// Callback for streaming log lines during a build.
+    typealias LogCallback = @Sendable (String) async -> Void
+
     /// Sentinel value indicating that no build step is needed (static site).
     /// The site's files are uploaded directly from the output directory.
     private static let staticBuildCommands: Set<String> = [
@@ -30,7 +33,8 @@ struct BuildExecutor: Sendable {
     }
 
     /// Run the full build pipeline for a single command.
-    func execute(_ cmd: BuildCommand) async throws -> BuildResult {
+    /// - Parameter onLog: Optional callback invoked for each line of output (for live streaming).
+    func execute(_ cmd: BuildCommand, onLog: LogCallback? = nil) async throws -> BuildResult {
         let buildDir = "\(config.workDir)/\(cmd.id)"
 
         defer {
@@ -42,32 +46,43 @@ struct BuildExecutor: Sendable {
         try FileManager.default.createDirectory(atPath: buildDir, withIntermediateDirectories: true)
 
         // 2. Clone repository
-        logger.info("[\(cmd.id)] Cloning \(cmd.repositoryUrl) branch=\(cmd.branch)")
-        let cloneResult = await shell(
-            "git", "clone", "--depth=1", "--branch", cmd.branch,
-            cmd.repositoryUrl, "\(buildDir)/repo"
+        let cloneMsg = "Cloning \(cmd.repositoryUrl) (branch: \(cmd.branch))..."
+        logger.info("[\(cmd.id)] \(cloneMsg)")
+        await onLog?(cloneMsg)
+
+        let cloneResult = await streamingShell(
+            args: ["git", "clone", "--depth=1", "--branch", cmd.branch, cmd.repositoryUrl, "\(buildDir)/repo"],
+            onLine: onLog
         )
         guard cloneResult.exitCode == 0 else {
-            logger.error("[\(cmd.id)] git clone failed (exit \(cloneResult.exitCode)):\n\(cloneResult.output)")
+            let errMsg = "git clone failed (exit \(cloneResult.exitCode))"
+            logger.error("[\(cmd.id)] \(errMsg)")
+            await onLog?("ERROR: \(errMsg)")
             return BuildResult(
                 success: false, artifactLocation: nil,
-                errorMessage: "git clone failed (exit \(cloneResult.exitCode))",
+                errorMessage: errMsg,
                 logSnippet: cloneResult.lastLines(50)
             )
         }
-        logger.info("[\(cmd.id)] Clone succeeded")
+        await onLog?("Clone completed successfully.")
 
         // 3. Checkout specific commit if provided
         if let sha = cmd.commitSha {
-            logger.info("[\(cmd.id)] Checking out commit \(sha)")
-            let checkoutResult = await shell(
-                "git", "-C", "\(buildDir)/repo", "checkout", sha
+            let checkoutMsg = "Checking out commit \(sha)..."
+            logger.info("[\(cmd.id)] \(checkoutMsg)")
+            await onLog?(checkoutMsg)
+
+            let checkoutResult = await streamingShell(
+                args: ["git", "-C", "\(buildDir)/repo", "checkout", sha],
+                onLine: onLog
             )
             guard checkoutResult.exitCode == 0 else {
-                logger.error("[\(cmd.id)] git checkout failed (exit \(checkoutResult.exitCode)):\n\(checkoutResult.output)")
+                let errMsg = "git checkout \(sha) failed (exit \(checkoutResult.exitCode))"
+                logger.error("[\(cmd.id)] \(errMsg)")
+                await onLog?("ERROR: \(errMsg)")
                 return BuildResult(
                     success: false, artifactLocation: nil,
-                    errorMessage: "git checkout \(sha) failed (exit \(checkoutResult.exitCode))",
+                    errorMessage: errMsg,
                     logSnippet: checkoutResult.lastLines(50)
                 )
             }
@@ -76,28 +91,32 @@ struct BuildExecutor: Sendable {
         // 4. Run build command — or skip for static sites
         let repoDir = "\(buildDir)/repo"
         if isStaticSite(cmd.buildCommand) {
-            logger.info("[\(cmd.id)] Static site — skipping build step")
+            let msg = "No build step required — uploading files directly."
+            logger.info("[\(cmd.id)] \(msg)")
+            await onLog?(msg)
         } else {
-            logger.info("[\(cmd.id)] Running build: \(cmd.buildCommand)")
-            let buildResult = await shell(
-                "sh", "-c", "cd \(repoDir) && \(cmd.buildCommand)"
+            let buildMsg = "Running build command: \(cmd.buildCommand)"
+            logger.info("[\(cmd.id)] \(buildMsg)")
+            await onLog?(buildMsg)
+
+            let buildResult = await streamingShell(
+                args: ["sh", "-c", "cd \(repoDir) && \(cmd.buildCommand)"],
+                onLine: onLog
             )
-            if !buildResult.output.isEmpty {
-                logger.info("[\(cmd.id)] Build output:\n\(buildResult.output)")
-            }
             guard buildResult.exitCode == 0 else {
-                logger.error("[\(cmd.id)] Build command failed (exit \(buildResult.exitCode))")
+                let errMsg = "Build command failed (exit \(buildResult.exitCode))"
+                logger.error("[\(cmd.id)] \(errMsg)")
+                await onLog?("ERROR: \(errMsg)")
                 return BuildResult(
                     success: false, artifactLocation: nil,
-                    errorMessage: "Build command failed (exit \(buildResult.exitCode))",
+                    errorMessage: errMsg,
                     logSnippet: buildResult.lastLines(100)
                 )
             }
-            logger.info("[\(cmd.id)] Build command succeeded")
+            await onLog?("Build completed successfully.")
         }
 
         // 5. Determine and validate output directory
-        //    For static sites with outputDirectory "." or empty, use the repo root
         let outputDir = cmd.outputDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
         let outputPath: String
         if outputDir.isEmpty || outputDir == "." {
@@ -107,28 +126,37 @@ struct BuildExecutor: Sendable {
         }
 
         guard FileManager.default.fileExists(atPath: outputPath) else {
-            logger.error("[\(cmd.id)] Output directory '\(cmd.outputDirectory)' not found after build")
+            let errMsg = "Output directory '\(cmd.outputDirectory)' not found after build"
+            logger.error("[\(cmd.id)] \(errMsg)")
+            await onLog?("ERROR: \(errMsg)")
             return BuildResult(
                 success: false, artifactLocation: nil,
-                errorMessage: "Output directory '\(cmd.outputDirectory)' not found after build",
+                errorMessage: errMsg,
                 logSnippet: nil
             )
         }
 
         // 6. Upload artifacts to S3
         guard let artifactId = cmd.artifactId else {
-            logger.error("[\(cmd.id)] No artifactId provided in build command")
+            let errMsg = "No artifactId provided in build command"
+            logger.error("[\(cmd.id)] \(errMsg)")
+            await onLog?("ERROR: \(errMsg)")
             return BuildResult(
                 success: false, artifactLocation: nil,
-                errorMessage: "No artifactId provided in build command",
+                errorMessage: errMsg,
                 logSnippet: nil
             )
         }
 
-        logger.info("[\(cmd.id)] Uploading artifacts to S3 under \(artifactId)/")
+        let uploadMsg = "Uploading artifacts to S3..."
+        logger.info("[\(cmd.id)] \(uploadMsg)")
+        await onLog?(uploadMsg)
+
         do {
             let location = try await s3Uploader.upload(localPath: outputPath, artifactId: artifactId)
-            logger.info("[\(cmd.id)] Build succeeded, artifacts at \(location)")
+            let doneMsg = "Deploy complete! Artifacts at \(location)"
+            logger.info("[\(cmd.id)] \(doneMsg)")
+            await onLog?(doneMsg)
             return BuildResult(
                 success: true,
                 artifactLocation: location,
@@ -136,17 +164,19 @@ struct BuildExecutor: Sendable {
                 logSnippet: nil
             )
         } catch {
-            logger.error("[\(cmd.id)] S3 upload failed: \(error)")
+            let errMsg = "S3 upload failed: \(error)"
+            logger.error("[\(cmd.id)] \(errMsg)")
+            await onLog?("ERROR: \(errMsg)")
             return BuildResult(
                 success: false, artifactLocation: nil,
-                errorMessage: "S3 upload failed: \(error)",
+                errorMessage: errMsg,
                 logSnippet: nil
             )
         }
     }
 }
 
-// MARK: - Shell helper
+// MARK: - Shell helpers
 
 struct ShellResult: Sendable {
     let exitCode: Int32
@@ -158,7 +188,13 @@ struct ShellResult: Sendable {
     }
 }
 
+/// Non-streaming shell execution (used by tests or when no log callback is needed).
 func shell(_ args: String...) async -> ShellResult {
+    await streamingShell(args: args, onLine: nil)
+}
+
+/// Streaming shell execution that invokes `onLine` for each line of combined stdout+stderr.
+func streamingShell(args: [String], onLine: (@Sendable (String) async -> Void)?) async -> ShellResult {
     await withCheckedContinuation { continuation in
         let process = Process()
         let pipe = Pipe()
@@ -171,15 +207,50 @@ func shell(_ args: String...) async -> ShellResult {
         do {
             try process.run()
 
-            // Read all data BEFORE waitUntilExit to avoid pipe buffer deadlock
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
+            // Read output line-by-line for streaming
+            if let onLine = onLine {
+                Task {
+                    let handle = pipe.fileHandleForReading
+                    var accumulated = Data()
+                    var allOutput = ""
 
-            let output = String(data: data, encoding: .utf8) ?? ""
-            continuation.resume(returning: ShellResult(
-                exitCode: process.terminationStatus,
-                output: output
-            ))
+                    while true {
+                        let chunk = handle.availableData
+                        if chunk.isEmpty { break }
+                        accumulated.append(chunk)
+
+                        // Process complete lines
+                        while let range = accumulated.range(of: Data("\n".utf8)) {
+                            let lineData = accumulated.subdata(in: accumulated.startIndex..<range.lowerBound)
+                            accumulated.removeSubrange(accumulated.startIndex..<range.upperBound)
+                            if let line = String(data: lineData, encoding: .utf8) {
+                                allOutput += line + "\n"
+                                await onLine(line)
+                            }
+                        }
+                    }
+
+                    // Flush remaining partial line
+                    if !accumulated.isEmpty, let line = String(data: accumulated, encoding: .utf8), !line.isEmpty {
+                        allOutput += line
+                        await onLine(line)
+                    }
+
+                    process.waitUntilExit()
+                    continuation.resume(returning: ShellResult(
+                        exitCode: process.terminationStatus,
+                        output: allOutput
+                    ))
+                }
+            } else {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                let output = String(data: data, encoding: .utf8) ?? ""
+                continuation.resume(returning: ShellResult(
+                    exitCode: process.terminationStatus,
+                    output: output
+                ))
+            }
         } catch {
             continuation.resume(returning: ShellResult(
                 exitCode: -1,
